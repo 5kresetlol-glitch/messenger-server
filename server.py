@@ -1,47 +1,62 @@
-from fastapi import FastAPI, WebSocket
-from typing import List
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import json # Импортируем библиотеку для работы с JSON
+from typing import Dict
 
-# Создаем экземпляр нашего сервера
+# --- Создаем класс для управления соединениями ---
+# Это более правильный подход, чем глобальный список.
+class ConnectionManager:
+    def __init__(self):
+        # Словарь для хранения активных подключений: "имя_пользователя": WebSocket
+        self.active_connections: Dict[str, WebSocket] = {}
+
+    async def connect(self, websocket: WebSocket, client_id: str):
+        await websocket.accept()
+        self.active_connections[client_id] = websocket
+        print(f"Клиент {client_id} подключился. Всего клиентов: {len(self.active_connections)}")
+
+    def disconnect(self, client_id: str):
+        if client_id in self.active_connections:
+            del self.active_connections[client_id]
+        print(f"Клиент {client_id} отключился. Всего клиентов: {len(self.active_connections)}")
+
+    async def broadcast(self, message: str):
+        # Рассылаем сообщение всем подключенным клиентам
+        for connection in self.active_connections.values():
+            await connection.send_text(message)
+
+# Создаем экземпляр менеджера
+manager = ConnectionManager()
+
+# Создаем экземпляр FastAPI
 app = FastAPI()
 
-# --- Наше "хранилище" активных подключений ---
-# Это простой список, куда мы будем складывать все активные WebSocket-соединения
-# В реальном приложении здесь была бы сложная логика с пользователями,
-# но для начала этого достаточно.
-active_connections: List[WebSocket] = []
-
-# -------------------------------------------------------------------
-# --- НОВЫЙ ОБРАБОТЧИК: для WebSocket-соединений ---
-# -------------------------------------------------------------------
-# @app.websocket("/ws") - это означает, что данный "коридор" будет доступен
-# по адресу ws://127.0.0.1:8000/ws
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    # --- 1. Прием нового подключения ---
-    await websocket.accept() # "Впускаем" нового клиента (наше Kivy-приложение)
-    active_connections.append(websocket) # Добавляем его в наш список активных
-    print(f"Новое подключение! Всего активных: {len(active_connections)}")
+# --- Обновляем наш WebSocket endpoint ---
+# Теперь он принимает имя пользователя прямо в URL
+@app.websocket("/ws/{client_id}")
+async def websocket_endpoint(websocket: WebSocket, client_id: str):
+    await manager.connect(websocket, client_id)
+    
+    # Сообщаем всем, что зашел новый пользователь
+    join_message = {"sender": "Сервер", "text": f"Пользователь '{client_id}' присоединился к чату."}
+    await manager.broadcast(json.dumps(join_message))
 
     try:
-        # --- 2. Бесконечный цикл для прослушивания сообщений ---
-        # Сервер будет "висеть" в этом цикле, пока клиент подключен
         while True:
-            # Ждем, пока клиент пришлет сообщение (в виде текста)
+            # Ждем сообщение от клиента
             data = await websocket.receive_text()
-            print(f"Получено сообщение: {data}")
-
-            # --- 3. Рассылка сообщения всем подключенным клиентам ---
-            # Мы проходим по всем соединениям в нашем списке...
-            for connection in active_connections:
-                # ...и отправляем им полученные данные
-                await connection.send_text(f"Сообщение от клиента: {data}")
-
-    # --- 4. Обработка отключения ---
-    except Exception as e:
-        # Этот блок сработает, когда клиент отключится (например, закроет приложение)
-        print(f"Клиент отключился. Ошибка: {e}")
-    finally:
-        # В любом случае удаляем его из списка активных
-        active_connections.remove(websocket)
-        print(f"Соединение закрыто. Всего активных: {len(active_connections)}")
+            
+            # --- Создаем JSON-объект с данными ---
+            message_data = {
+                "sender": client_id, # "Подписываем" сообщение именем отправителя
+                "text": data
+            }
+            
+            # Конвертируем в строку и рассылаем всем
+            await manager.broadcast(json.dumps(message_data))
+            
+    except WebSocketDisconnect:
+        manager.disconnect(client_id)
+        # Сообщаем всем, что пользователь вышел
+        left_message = {"sender": "Сервер", "text": f"Пользователь '{client_id}' покинул чат."}
+        await manager.broadcast(json.dumps(left_message))
 
