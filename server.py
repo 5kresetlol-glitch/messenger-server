@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from typing import Dict, List
@@ -25,7 +26,7 @@ messages_table = Table(
     Column("timestamp", DateTime, default=datetime.utcnow),
 )
 
-# --- ConnectionManager и FastAPI (без изменений) ---
+# --- ConnectionManager и FastAPI ---
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
@@ -41,8 +42,11 @@ class ConnectionManager:
         print(f"Клиент {client_id} отключился. Всего: {len(self.active_connections)}")
 
     async def broadcast(self, message: str):
-        for connection in self.active_connections.values():
-            await connection.send_text(message)
+        # Используем asyncio.gather для параллельной рассылки
+        await asyncio.gather(*(
+            connection.send_text(message)
+            for connection in self.active_connections.values()
+        ))
     
     async def send_personal_message(self, message: str, websocket: WebSocket):
         await websocket.send_text(message)
@@ -50,20 +54,17 @@ class ConnectionManager:
 manager = ConnectionManager()
 app = FastAPI()
 
-# --- Новые функции для работы с базой ---
+# --- Функции для работы с базой ---
 async def add_message_to_db(sender: str, text: str):
-    # Проверяем, что сессия была создана
     if not async_session:
         print("Ошибка: Сессия базы данных не инициализирована.")
         return
         
     async with async_session() as session:
         async with session.begin():
-            new_message = messages_table.insert().values(sender=sender, text=text)
-            await session.execute(new_message)
+            await session.execute(messages_table.insert().values(sender=sender, text=text))
 
 async def get_message_history(limit: int = 30) -> List[Dict]:
-    # Проверяем, что сессия была создана
     if not async_session:
         print("Ошибка: Сессия базы данных не инициализирована.")
         return []
@@ -71,7 +72,9 @@ async def get_message_history(limit: int = 30) -> List[Dict]:
     async with async_session() as session:
         query = messages_table.select().order_by(messages_table.c.timestamp.desc()).limit(limit)
         result = await session.execute(query)
+        # Преобразуем результат в список словарей
         history = [dict(row) for row in result.mappings()]
+        # Возвращаем в хронологическом порядке (от старых к новым)
         return list(reversed(history))
 
 # --- Главный WebSocket endpoint ---
@@ -79,16 +82,17 @@ async def get_message_history(limit: int = 30) -> List[Dict]:
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
     await manager.connect(websocket, client_id)
     
-    # 1. Отправляем историю только что подключившемуся клиенту
-    history = await get_message_history()
-    for msg in history:
-        msg['timestamp'] = msg['timestamp'].isoformat()
-        await manager.send_personal_message(json.dumps(msg), websocket)
-        
-    # 2. Сообщаем всем, что зашел новый пользователь
-    await manager.broadcast(json.dumps({"sender": "Сервер", "text": f"Пользователь '{client_id}' присоединился."}))
-
     try:
+        # 1. Отправляем историю только что подключившемуся клиенту
+        history = await get_message_history()
+        for msg in history:
+            # Конвертируем datetime в строку, чтобы JSON не ругался
+            msg['timestamp'] = msg['timestamp'].isoformat()
+            await manager.send_personal_message(json.dumps(msg), websocket)
+            
+        # 2. Сообщаем всем, что зашел новый пользователь
+        await manager.broadcast(json.dumps({"sender": "Сервер", "text": f"Пользователь '{client_id}' присоединился."}))
+
         while True:
             data = await websocket.receive_text()
             # 3. Сохраняем новое сообщение в базу
@@ -99,26 +103,40 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             await manager.broadcast(json.dumps(message_data))
             
     except WebSocketDisconnect:
+        # Этот блок сработает при нормальном отключении
         manager.disconnect(client_id)
         await manager.broadcast(json.dumps({"sender": "Сервер", "text": f"Пользователь '{client_id}' покинул чат."}))
+    except Exception as e:
+        # Этот блок сработает при любой другой ошибке
+        print(f"Произошла ошибка с клиентом {client_id}: {e}")
+        manager.disconnect(client_id)
+        await manager.broadcast(json.dumps({"sender": "Сервер", "text": f"Пользователь '{client_id}' отключился из-за ошибки."}))
+
 
 # --- Событие при запуске сервера: создаем подключение и таблицу ---
 @app.on_event("startup")
 async def startup():
     global async_session
     
-    # Получаем адрес базы из окружения
-    database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        print("Критическая ошибка: Переменная DATABASE_URL не установлена!")
+    # --- СОБИРАЕМ URL ВРУЧНУЮ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ---
+    DB_USER = os.environ.get("DB_USER")
+    DB_PASS = os.environ.get("DB_PASS")
+    DB_HOST = os.environ.get("DB_HOST")
+    DB_PORT = os.environ.get("DB_PORT")
+    DB_NAME = os.environ.get("DB_NAME")
+
+    if not all([DB_USER, DB_PASS, DB_HOST, DB_PORT, DB_NAME]):
+        print("Критическая ошибка: Одна или несколько переменных для подключения к БД не установлены!")
+        # Можно даже завершить работу, если база критична
+        # import sys
+        # sys.exit("Завершение работы из-за отсутствия настроек БД.")
         return
 
-    # "Чиним" URL для SQLAlchemy, чтобы он точно использовал asyncpg
-    if database_url.startswith("postgres://"):
-        database_url = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    # --- СОЗДАЕМ 100% ПРАВИЛЬНЫЙ URL ---
+    DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     
-    # Создаем "движок" внутри startup
-    engine = create_async_engine(database_url)
+    print("Попытка подключения к базе данных...")
+    engine = create_async_engine(DATABASE_URL)
 
     # Создаем таблицу, если ее нет
     async with engine.begin() as conn:
@@ -126,5 +144,4 @@ async def startup():
     
     # Создаем фабрику сессий, привязанную к движку
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    print("--- Сервер запущен, подключение к базе данных настроено. ---")
-
+    print("--- Сервер запущен, подключение к БД настроено (ручной режим). ---")
