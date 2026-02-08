@@ -12,8 +12,10 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 
 # --- Получаем "адрес" базы данных из настроек Render ---
-# Мы добавим его в переменные окружения на сайте Render
-DATABASE_URL = os.environ.get("DATABASE_URL")
+# "Чиним" URL для SQLAlchemy, чтобы он точно использовал asyncpg
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+
 
 # Создаем "движок" для асинхронной работы с базой
 engine = create_async_engine(DATABASE_URL)
@@ -98,3 +100,4 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
+
