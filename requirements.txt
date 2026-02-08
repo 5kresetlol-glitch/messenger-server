@@ -3,3 +3,4 @@ uvicorn
 websockets
 sqlalchemy
 asyncpg
+psycopg2-binary
