@@ -57,12 +57,16 @@ app = FastAPI()
 # --- Функции для работы с базой ---
 async def add_message_to_db(sender: str, text: str):
     if not async_session:
-        print("Ошибка: Сессия базы данных не инициализирована.")
+        print("ОШИБКА СОХРАНЕНИЯ: Сессия БД не создана.")
         return
-        
-    async with async_session() as session:
-        async with session.begin():
+    try:
+        async with async_session() as session:
             await session.execute(messages_table.insert().values(sender=sender, text=text))
+            await session.commit() # <--- ЯВНОЕ ПОДТВЕРЖДЕНИЕ
+        print(f"Сообщение от {sender} сохранено в БД.")
+    except Exception as e:
+        print(f"!!! ОШИБКА при сохранении в БД: {e}")
+
 
 async def get_message_history(limit: int = 30) -> List[Dict]:
     if not async_session:
