@@ -4,6 +4,8 @@ import asyncio
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from typing import Dict, List
+from datetime import datetime, timezone # <--- ИЗМЕНЕНО
+
 
 # --- SQLAlchemy (работа с базой данных) ---
 from sqlalchemy import (
@@ -23,7 +25,7 @@ messages_table = Table(
     Column("id", Integer, primary_key=True),
     Column("sender", String(255)),
     Column("text", String),
-    Column("timestamp", DateTime, default=datetime.utcnow),
+    Column("timestamp", DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)), # <--- ИЗМЕНЕНО,
 )
 
 # --- ConnectionManager и FastAPI ---
